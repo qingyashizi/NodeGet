@@ -1,0 +1,94 @@
+name: notes-test
+
+# 临时测试用：只验证发布日志相关的几步，不做构建、不推 Docker。测完整条分支会删除。
+on:
+  push:
+    branches: ["notes-test-run-*"]
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    if: contains(github.ref_name, '-nightly-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fake binaries
+        run: mkdir dist && echo test > dist/test.txt
+
+      # 把 nightly tag 移动到本次构建的提交，否则 tag 会停留在上一次的提交上
+      - name: Move nightly tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          if gh api "repos/${REPO}/git/ref/tags/nightly" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/${REPO}/git/refs/tags/nightly" -f sha="${SHA}" -F force=true
+          else
+            gh api -X POST "repos/${REPO}/git/refs" -f ref="refs/tags/nightly" -f sha="${SHA}"
+          fi
+
+      # 发布日志 = 固定说明 + 自上一个正式版以来合并的 PR 列表。
+      # nightly tag 每天移动、不是版本号，GitHub 找不到"上一个版本"，所以要明确指定起点：最新的正式版。
+      # 必须放在 "Move nightly tag" 之后，这样 nightly 才指向本次构建的提交。
+      # 生成失败（例如还没有正式版）不应该影响 nightly 发布，此时只保留固定说明。
+      - name: Generate release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > release-notes.md <<EOF
+          自动构建的 nightly 版本，来自开发分支提交 \`${SHA}\`。
+          **不保证稳定，普通用户请使用正式版。**
+
+          安装 / 升级方式见文档「自动化脚本安装」中的预发布与 nightly 一节。
+          EOF
+
+          if previous=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name) && [[ -n "${previous}" ]]; then
+            if notes=$(gh api -X POST "repos/${REPO}/releases/generate-notes" \
+              -f tag_name=nightly -f previous_tag_name="${previous}" --jq .body); then
+              printf '\n---\n\n**相对 %s 的变更**\n\n%s\n' "${previous}" "${notes}" >> release-notes.md
+            else
+              echo "Failed to generate release notes, keeping the fixed text only." >&2
+            fi
+          else
+            echo "No stable release found, keeping the fixed text only." >&2
+          fi
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: NodeGet Nightly
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          body_path: release-notes.md
+          files: dist/*
+
+  release:
+    if: contains(github.ref_name, '-release-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME##*-release-}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fake binaries
+        run: mkdir dist && echo test > dist/test.txt
+
+      # 与 release.yml 里 "Upload release assets" 一致，只把 tag 换成测试 tag
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: NodeGet ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          files: dist/*
